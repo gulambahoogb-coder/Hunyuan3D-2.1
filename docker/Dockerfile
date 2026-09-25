@@ -63,6 +63,9 @@ RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git
 # Install Python dependencies from modified requirements.txt
 RUN pip install -r Hunyuan3D-2.1/requirements.txt
 
+# Install the RunPod SDK so handler.py can use it
+RUN pip install runpod
+
 # Install custom_rasterizer
 RUN cd /workspace/Hunyuan3D-2.1/hy3dpaint/custom_rasterizer && \
     # Set compilation environment variables
@@ -108,7 +111,10 @@ RUN rm -f /workspace/*.zip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy our RunPod handler script into the repo folder
+COPY handler.py /workspace/Hunyuan3D-2.1/handler.py
+
 # Set default command
 WORKDIR /workspace/Hunyuan3D-2.1
 RUN mkdir gradio_cache
-CMD ["python", "api_server.py"]
+CMD ["python", "handler.py"]
