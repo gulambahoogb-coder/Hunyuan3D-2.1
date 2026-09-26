@@ -45,7 +45,13 @@ print("Loading Hunyuan3D-2.1 shape model... (this happens once at startup)")
 MODEL_PATH = "tencent/Hunyuan3D-2.1"
 
 shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(MODEL_PATH)
-paint_pipeline = Hunyuan3DPaintPipeline(Hunyuan3DPaintConfig(max_num_view=6, resolution=512))
+
+paint_config = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
+paint_config.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+paint_config.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+paint_config.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+paint_pipeline = Hunyuan3DPaintPipeline(paint_config)
+
 background_remover = BackgroundRemover()
 
 print("Model loaded. Ready to accept requests.")
@@ -90,7 +96,12 @@ def handler(job):
             image_path = tmp_img.name
 
         # STEP B: Add realistic texture/color to the shape
-        textured_mesh_path = paint_pipeline(shape_path, image_path=image_path)
+        textured_output_path = tempfile.NamedTemporaryFile(suffix="_textured.glb", delete=False).name
+        textured_mesh_path = paint_pipeline(
+            mesh_path=shape_path,
+            image_path=image_path,
+            output_mesh_path=textured_output_path
+        )
 
         # Read the final textured model and encode it to send back
         with open(textured_mesh_path, "rb") as f:
