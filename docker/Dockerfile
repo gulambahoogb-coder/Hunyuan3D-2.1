@@ -66,9 +66,10 @@ RUN sed -i 's/bpy==4.0/bpy==4.2.0/' Hunyuan3D-2.1/requirements.txt
 # Install Python dependencies from modified requirements.txt
 RUN pip install --no-build-isolation -r Hunyuan3D-2.1/requirements.txt
 
-# Install the RunPod SDK, plus setuptools (provides pkg_resources, which
-# pytorch_lightning/lightning_fabric needs but doesn't install itself)
-RUN pip install runpod setuptools
+# Install the RunPod SDK, plus an OLDER pinned setuptools that still
+# includes pkg_resources (newer setuptools versions removed it, which
+# broke pytorch_lightning/lightning_fabric's import)
+RUN pip install runpod "setuptools==69.5.1"
 
 # Pre-download the Hunyuan3D-2.1 model weights into the exact cache path the code expects
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='tencent/Hunyuan3D-2.1', local_dir='/root/.cache/hy3dgen/tencent/Hunyuan3D-2.1')"
