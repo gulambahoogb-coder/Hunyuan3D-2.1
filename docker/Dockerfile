@@ -69,6 +69,9 @@ RUN pip install --no-build-isolation -r Hunyuan3D-2.1/requirements.txt
 # Install the RunPod SDK so handler.py can use it
 RUN pip install runpod
 
+# Pre-download the Hunyuan3D-2.1 model weights into the exact cache path the code expects
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='tencent/Hunyuan3D-2.1', local_dir='/root/.cache/hy3dgen/tencent/Hunyuan3D-2.1')"
+
 # Install custom_rasterizer
 RUN cd /workspace/Hunyuan3D-2.1/hy3dpaint/custom_rasterizer && \
     # Set compilation environment variables
