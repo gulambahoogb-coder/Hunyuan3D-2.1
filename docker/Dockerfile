@@ -60,6 +60,9 @@ RUN pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url h
 # Clone Hunyuan3D-2.1 repository
 RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git
 
+# Fix an outdated/invalid bpy version pin in Tencent's requirements.txt
+RUN sed -i 's/bpy==4.0/bpy==4.2.0/' Hunyuan3D-2.1/requirements.txt
+
 # Install Python dependencies from modified requirements.txt
 RUN pip install --no-build-isolation -r Hunyuan3D-2.1/requirements.txt
 
