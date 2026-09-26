@@ -42,7 +42,7 @@ except Exception as e:
 # STEP 1: Load the model ONCE
 # -----------------------------
 print("Loading Hunyuan3D-2.1 shape model... (this happens once at startup)")
-MODEL_PATH = "tencent/Hunyuan3D-2.1"
+MODEL_PATH = "/root/.cache/hy3dgen/tencent/Hunyuan3D-2.1"
 
 shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(MODEL_PATH)
 
