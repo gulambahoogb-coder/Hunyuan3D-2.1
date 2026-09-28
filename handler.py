@@ -1,31 +1,40 @@
 """
-RunPod Serverless Handler - Hunyuan3D-2.1 V2 Ultra Quality
-===========================================================
+RunPod Serverless Handler
+Hunyuan3D-2.1 - Production High Quality
 
-Image -> 3D production pipeline.
+FINAL PRODUCTION BASELINE
 
-V2 improvements:
-1. Better image preprocessing
-2. EXIF orientation correction
-3. High-resolution working image
-4. Edge-preserving alpha cleanup
-5. Better subject cropping/framing
-6. Multiple quality presets
-7. Multi-seed candidate generation
-8. Automatic candidate quality scoring
-9. Better mesh cleanup
-10. Connected-component filtering
-11. Normal repair
-12. Optional mesh face reduction
-13. Hunyuan3D PBR texture generation
-14. Ultra texture mode: 9 views / 768 resolution
-15. Better temporary-file cleanup
-16. CUDA memory cleanup
-17. Detailed timing/logging
-18. Safer base64 decoding
-19. Better RunPod error handling
+Pipeline:
+    Image
+      ↓
+    EXIF correction
+      ↓
+    Background removal
+      ↓
+    Edge-preserving alpha cleanup
+      ↓
+    Smart character framing
+      ↓
+    Hunyuan3D-2.1 Shape
+      ↓
+    Mesh validation
+      ↓
+    Official Hunyuan3D-2.1 PBR Paint
+      ↓
+    Textured GLB
 
-Expected input:
+Quality-first configuration:
+    Shape:
+        60 diffusion steps
+        octree 512
+        guidance 5.0
+        chunks 10000
+
+    Texture:
+        9 views
+        768 resolution
+
+Input:
 
 {
     "image_base64": "..."
@@ -34,72 +43,71 @@ Expected input:
 Optional:
 
 {
-    "quality": "ultra",
     "seed": 1234,
-    "candidate_count": 2,
 
     "steps": 60,
     "octree_resolution": 512,
     "guidance_scale": 5.0,
     "num_chunks": 10000,
 
-    "texture_resolution": 768,
-    "max_num_view": 9,
-
-    "face_count": 100000
+    "enable_flashvdm": false
 }
 
-Quality presets:
+Output:
 
-fast
-high
-ultra
-
-NOTE:
-Ultra quality requires substantially more GPU memory/time.
-Tencent's current Hunyuan3D-2.1 Paint documentation recommends
-at least ~21 GB VRAM for 6 views at 512 resolution.
-9 views / 768 can require substantially more.
+{
+    "model_base64": "...",
+    "format": "glb"
+}
 """
 
-import sys
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import os
+import sys
 import io
 import gc
+import time
 import base64
 import tempfile
 import traceback
-import time
-import math
 
-import torch
 import numpy as np
+import torch
 
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 
 # =========================================================
-# PATHS
+# LOCAL HUNYUAN PATHS
 # =========================================================
 
 sys.path.insert(0, "./hy3dshape")
 sys.path.insert(0, "./hy3dpaint")
 
 # =========================================================
-# IMPORTS
+# RUNPOD
 # =========================================================
 
 import runpod
 
-from hy3dshape.rembg import BackgroundRemover
-from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+# =========================================================
+# HUNYUAN IMPORTS
+# =========================================================
 
-from textureGenPipeline import (
+from hy3dshape.rembg import BackgroundRemover
+from hy3dshape.pipelines import (
+    Hunyuan3DDiTFlowMatchingPipeline,
+)
+
+from hy3dpaint.textureGenPipeline import (
     Hunyuan3DPaintPipeline,
     Hunyuan3DPaintConfig,
 )
 
 # =========================================================
-# OPTIONAL TORCHVISION FIX
+# OPTIONAL TORCHVISION COMPATIBILITY
 # =========================================================
 
 try:
@@ -110,14 +118,12 @@ try:
     print("[INFO] torchvision compatibility fix applied.")
 
 except ImportError:
-    print(
-        "[WARN] torchvision_fix not found. "
-        "Continuing without compatibility patch."
-    )
+    print("[INFO] torchvision_fix not installed.")
 
 except Exception as e:
     print(
-        f"[WARN] torchvision_fix failed: {e}"
+        "[WARN] torchvision_fix failed:",
+        str(e)
     )
 
 
@@ -125,74 +131,74 @@ except Exception as e:
 # CONFIGURATION
 # =========================================================
 
-MODEL_PATH = (
+MODEL_PATH = os.environ.get(
+    "HUNYUAN_MODEL_PATH",
     "/root/.cache/hy3dgen/tencent/Hunyuan3D-2.1"
 )
 
-DEFAULT_SEED = 1234
+DEFAULT_SEED = int(
+    os.environ.get(
+        "HUNYUAN_DEFAULT_SEED",
+        "1234"
+    )
+)
+
+# ---------------------------------------------------------
+# QUALITY-FIRST DEFAULTS
+# ---------------------------------------------------------
+
+DEFAULT_STEPS = 60
+
+DEFAULT_OCTREE_RESOLUTION = 512
+
+DEFAULT_GUIDANCE_SCALE = 5.0
+
+DEFAULT_NUM_CHUNKS = 10000
+
+# ---------------------------------------------------------
+# OFFICIAL PAINT CONFIGURATION
+# ---------------------------------------------------------
+
+PAINT_MAX_NUM_VIEW = 9
+
+PAINT_RESOLUTION = 768
+
+# ---------------------------------------------------------
+# OPTIONAL PERFORMANCE FEATURES
+#
+# Disabled by default.
+#
+# They are mainly for speed/memory, not visual quality.
+# ---------------------------------------------------------
+
+ENABLE_FLASHVDM = (
+    os.environ.get(
+        "HUNYUAN_ENABLE_FLASHVDM",
+        "false"
+    ).lower()
+    in ("1", "true", "yes")
+)
+
+ENABLE_COMPILE = (
+    os.environ.get(
+        "HUNYUAN_ENABLE_COMPILE",
+        "false"
+    ).lower()
+    in ("1", "true", "yes")
+)
 
 
 # =========================================================
-# QUALITY PRESETS
-# =========================================================
-
-QUALITY_PRESETS = {
-
-    "fast": {
-        "steps": 30,
-        "octree_resolution": 256,
-        "guidance_scale": 5.0,
-        "num_chunks": 8000,
-
-        "texture_resolution": 512,
-        "max_num_view": 6,
-
-        "candidate_count": 1,
-
-        "face_count": 50000,
-    },
-
-    "high": {
-        "steps": 50,
-        "octree_resolution": 384,
-        "guidance_scale": 5.0,
-        "num_chunks": 8000,
-
-        "texture_resolution": 512,
-        "max_num_view": 9,
-
-        "candidate_count": 1,
-
-        "face_count": 75000,
-    },
-
-    "ultra": {
-        "steps": 60,
-        "octree_resolution": 512,
-        "guidance_scale": 5.0,
-        "num_chunks": 10000,
-
-        "texture_resolution": 768,
-        "max_num_view": 9,
-
-        "candidate_count": 2,
-
-        "face_count": 100000,
-    },
-}
-
-
-# =========================================================
-# GLOBAL MODEL LOADING
+# STARTUP INFORMATION
 # =========================================================
 
 print("")
-print("====================================================")
-print(" HUNYUAN3D-2.1 V2 ULTRA QUALITY WORKER")
-print("====================================================")
+print("======================================================")
+print(" HUNYUAN3D-2.1 FINAL PRODUCTION WORKER")
+print("======================================================")
 
 print(
-    "[INFO] Model path:",
+    "[INFO] Model:",
     MODEL_PATH
 )
 
@@ -201,40 +207,139 @@ print(
     torch.cuda.is_available()
 )
 
-if torch.cuda.is_available():
+if not torch.cuda.is_available():
 
-    print(
-        "[INFO] CUDA device:",
-        torch.cuda.get_device_name(0)
+    raise RuntimeError(
+        "CUDA GPU is required for Hunyuan3D-2.1."
     )
 
-    print(
-        "[INFO] VRAM:",
-        round(
-            torch.cuda.get_device_properties(0).total_memory
-            / (1024 ** 3),
-            2
-        ),
-        "GB"
-    )
+print(
+    "[INFO] GPU:",
+    torch.cuda.get_device_name(0)
+)
+
+gpu_memory = (
+    torch.cuda.get_device_properties(0)
+    .total_memory
+    / (1024 ** 3)
+)
+
+print(
+    "[INFO] VRAM:",
+    round(gpu_memory, 2),
+    "GB"
+)
+
+print(
+    "[INFO] Shape steps:",
+    DEFAULT_STEPS
+)
+
+print(
+    "[INFO] Shape octree:",
+    DEFAULT_OCTREE_RESOLUTION
+)
+
+print(
+    "[INFO] Paint views:",
+    PAINT_MAX_NUM_VIEW
+)
+
+print(
+    "[INFO] Paint resolution:",
+    PAINT_RESOLUTION
+)
+
+print(
+    "[INFO] FlashVDM:",
+    ENABLE_FLASHVDM
+)
+
+print(
+    "[INFO] Compile:",
+    ENABLE_COMPILE
+)
 
 
 # =========================================================
-# SHAPE MODEL
+# LOAD SHAPE MODEL
 # =========================================================
 
 print("")
-print("[LOAD] Loading Hunyuan3D shape model...")
+print("[LOAD] Loading Hunyuan3D-2.1 shape model...")
 
 shape_pipeline = (
-    Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+    Hunyuan3DDiTFlowMatchingPipeline
+    .from_pretrained(
         MODEL_PATH
     )
 )
 
 print(
-    "[LOAD] Shape model loaded."
+    "[LOAD] Shape model ready."
 )
+
+
+# =========================================================
+# OPTIONAL FLASHVDM
+# =========================================================
+
+if ENABLE_FLASHVDM:
+
+    try:
+
+        print(
+            "[LOAD] Enabling FlashVDM..."
+        )
+
+        shape_pipeline.enable_flashvdm(
+            mc_algo="mc"
+        )
+
+        print(
+            "[LOAD] FlashVDM enabled."
+        )
+
+    except Exception as e:
+
+        print(
+            "[WARN] FlashVDM could not be enabled:",
+            str(e)
+        )
+
+        print(
+            "[WARN] Continuing with standard VAE decoding."
+        )
+
+
+# =========================================================
+# OPTIONAL COMPILE
+# =========================================================
+
+if ENABLE_COMPILE:
+
+    try:
+
+        print(
+            "[LOAD] Compiling shape pipeline..."
+        )
+
+        shape_pipeline.compile()
+
+        print(
+            "[LOAD] Shape pipeline compiled."
+        )
+
+    except Exception as e:
+
+        print(
+            "[WARN] Pipeline compilation failed:",
+            str(e)
+        )
+
+        print(
+            "[WARN] Continuing without compile."
+        )
 
 
 # =========================================================
@@ -242,66 +347,45 @@ print(
 # =========================================================
 
 print("")
-print("[LOAD] Loading background remover...")
+print(
+    "[LOAD] Loading background remover..."
+)
 
 background_remover = BackgroundRemover()
 
 print(
-    "[LOAD] Background remover loaded."
+    "[LOAD] Background remover ready."
 )
 
 
 # =========================================================
-# PAINT PIPELINE
+# OFFICIAL PBR PAINT PIPELINE
 # =========================================================
-
-# Ultra defaults.
-#
-# IMPORTANT:
-# We create this globally using the Ultra configuration.
-# If you want to reduce VRAM, change these to 6/512.
-# =========================================================
-
-ULTRA_MAX_NUM_VIEW = 9
-ULTRA_TEXTURE_RESOLUTION = 768
 
 print("")
-print("[LOAD] Loading Hunyuan3D PBR paint pipeline...")
 print(
-    "[LOAD] Views:",
-    ULTRA_MAX_NUM_VIEW
-)
-print(
-    "[LOAD] Texture resolution:",
-    ULTRA_TEXTURE_RESOLUTION
+    "[LOAD] Loading official Hunyuan3D-2.1 PBR pipeline..."
 )
 
 paint_config = Hunyuan3DPaintConfig(
-    max_num_view=ULTRA_MAX_NUM_VIEW,
-    resolution=ULTRA_TEXTURE_RESOLUTION,
+    max_num_view=PAINT_MAX_NUM_VIEW,
+    resolution=PAINT_RESOLUTION,
 )
+
+# ---------------------------------------------------------
+# OFFICIAL PATHS
+# ---------------------------------------------------------
 
 paint_config.realesrgan_ckpt_path = (
     "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
 )
 
 paint_config.multiview_cfg_path = (
-    "hy3paint/cfgs/hunyuan-paint-pbr.yaml"
-)
-
-# Correct path used by the official Hunyuan3D-2.1
-# project configuration.
-paint_config.multiview_cfg_path = (
     "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
 )
 
 paint_config.custom_pipeline = (
-    "hy3paint/hunyuanpaintpbr"
-)
-
-# Correct official custom pipeline name.
-paint_config.custom_pipeline = (
-    "hy3paint/hunyuanpaintpbr"
+    "hy3dpaint/hunyuanpaintpbr"
 )
 
 paint_pipeline = Hunyuan3DPaintPipeline(
@@ -309,27 +393,32 @@ paint_pipeline = Hunyuan3DPaintPipeline(
 )
 
 print(
-    "[LOAD] Paint model loaded."
+    "[LOAD] Official PBR paint pipeline ready."
 )
 
 
+# =========================================================
+# READY
+# =========================================================
+
 print("")
-print("====================================================")
-print(" HUNYUAN3D-2.1 V2 READY")
-print("====================================================")
+print("======================================================")
+print(" HUNYUAN3D-2.1 FINAL WORKER READY")
+print("======================================================")
 print("")
 
 
 # =========================================================
-# UTILITY: TIMER
+# TIMER
 # =========================================================
 
-class StageTimer:
+class Timer:
 
     def __init__(self):
         self.start = time.perf_counter()
 
     def elapsed(self):
+
         return round(
             time.perf_counter() - self.start,
             3
@@ -337,44 +426,61 @@ class StageTimer:
 
 
 # =========================================================
-# IMAGE HELPERS
+# BASE64 DECODER
 # =========================================================
 
-def decode_base64_image(image_b64):
-    """
-    Decode normal or data-URL base64 image.
-    """
+def decode_image_base64(data):
 
-    if not isinstance(image_b64, str):
+    if not isinstance(
+        data,
+        str
+    ):
+
         raise ValueError(
             "image_base64 must be a string."
         )
 
-    # Handle:
+    data = data.strip()
 
-    # data:image/png;base64,AAAA...
-    if image_b64.startswith("data:"):
+    # -----------------------------------------------------
+    # DATA URL
+    # -----------------------------------------------------
 
-        try:
-            image_b64 = image_b64.split(
-                ",",
-                1
-            )[1]
+    if data.startswith("data:"):
 
-        except Exception:
+        if "," not in data:
+
             raise ValueError(
-                "Invalid data URL."
+                "Invalid image data URL."
             )
 
-    # Remove whitespace/newlines.
-    image_b64 = "".join(
-        image_b64.split()
+        data = data.split(
+            ",",
+            1
+        )[1]
+
+    # -----------------------------------------------------
+    # REMOVE WHITESPACE
+    # -----------------------------------------------------
+
+    data = "".join(
+        data.split()
     )
+
+    if not data:
+
+        raise ValueError(
+            "Empty image data."
+        )
+
+    # -----------------------------------------------------
+    # DECODE
+    # -----------------------------------------------------
 
     try:
 
         return base64.b64decode(
-            image_b64,
+            data,
             validate=True
         )
 
@@ -386,63 +492,17 @@ def decode_base64_image(image_b64):
 
 
 # =========================================================
-# ALPHA CLEANUP
-# =========================================================
-
-def clean_alpha(alpha):
-    """
-    Preserve edges while removing tiny alpha noise.
-    """
-
-    alpha_np = np.asarray(
-        alpha,
-        dtype=np.uint8
-    )
-
-    # Remove extremely weak alpha noise.
-    alpha_np = np.where(
-        alpha_np < 8,
-        0,
-        alpha_np
-    ).astype(np.uint8)
-
-    cleaned = Image.fromarray(
-        alpha_np,
-        mode="L"
-    )
-
-    # Very small blur only.
-    #
-    # We intentionally do NOT use a large blur because
-    # characters can contain thin hair/accessory edges.
-    cleaned = cleaned.filter(
-        ImageFilter.GaussianBlur(
-            radius=0.15
-        )
-    )
-
-    return cleaned
-
-
-# =========================================================
 # IMAGE PREPROCESSING
 # =========================================================
 
 def preprocess_image(image):
-    """
-    High-quality subject preprocessing.
 
-    Important:
-    The original high-resolution image is preserved as much
-    as possible before creating the 1024 model input.
-    """
-
-    timer = StageTimer()
+    timer = Timer()
 
     print("")
-    print("----------------------------------------------------")
-    print("[IMAGE] PREPROCESSING")
-    print("----------------------------------------------------")
+    print("------------------------------------------------------")
+    print(" IMAGE PREPROCESSING")
+    print("------------------------------------------------------")
 
     print(
         "[IMAGE] Original:",
@@ -451,7 +511,7 @@ def preprocess_image(image):
     )
 
     # -----------------------------------------------------
-    # EXIF
+    # EXIF ORIENTATION
     # -----------------------------------------------------
 
     image = ImageOps.exif_transpose(
@@ -467,49 +527,67 @@ def preprocess_image(image):
     )
 
     # -----------------------------------------------------
-    # BACKGROUND
+    # BACKGROUND REMOVAL
     # -----------------------------------------------------
 
     print(
         "[IMAGE] Removing background..."
     )
 
-    removed = background_remover(
+    rgba = background_remover(
         image
     )
 
-    if removed is None:
+    if rgba is None:
 
         raise RuntimeError(
             "Background remover returned None."
         )
 
-    removed = removed.convert(
+    rgba = rgba.convert(
         "RGBA"
-    )
-
-    print(
-        "[IMAGE] Background removed."
     )
 
     # -----------------------------------------------------
     # ALPHA
+    #
+    # IMPORTANT:
+    # Do NOT aggressively blur the alpha.
+    #
+    # Hair, hats, fingers, shoes, weapons/accessories,
+    # ears and other thin geometry can be damaged by
+    # excessive alpha smoothing.
     # -----------------------------------------------------
 
-    alpha = removed.getchannel(
+    alpha = rgba.getchannel(
         "A"
     )
 
-    alpha = clean_alpha(
-        alpha
+    alpha_np = np.asarray(
+        alpha,
+        dtype=np.uint8
     )
 
-    removed.putalpha(
+    # Only remove almost-invisible noise.
+    alpha_np = np.where(
+        alpha_np < 3,
+        0,
+        alpha_np
+    ).astype(
+        np.uint8
+    )
+
+    alpha = Image.fromarray(
+        alpha_np,
+        mode="L"
+    )
+
+    rgba.putalpha(
         alpha
     )
 
     # -----------------------------------------------------
-    # BOUNDING BOX
+    # FIND SUBJECT
     # -----------------------------------------------------
 
     bbox = alpha.getbbox()
@@ -517,7 +595,26 @@ def preprocess_image(image):
     if bbox is None:
 
         raise RuntimeError(
-            "No foreground object detected."
+            "No foreground subject detected."
+        )
+
+    left, top, right, bottom = bbox
+
+    subject_width = (
+        right - left
+    )
+
+    subject_height = (
+        bottom - top
+    )
+
+    if (
+        subject_width < 8
+        or subject_height < 8
+    ):
+
+        raise RuntimeError(
+            "Detected subject is too small."
         )
 
     print(
@@ -525,53 +622,47 @@ def preprocess_image(image):
         bbox
     )
 
-    left, top, right, bottom = bbox
+    # -----------------------------------------------------
+    # CHARACTER PADDING
+    #
+    # Enough space for hair/accessories.
+    # -----------------------------------------------------
 
-    subject_w = right - left
-    subject_h = bottom - top
-
-    if subject_w <= 4 or subject_h <= 4:
-
-        raise RuntimeError(
-            "Detected foreground is too small."
+    pad_x = max(
+        12,
+        int(
+            subject_width * 0.08
         )
-
-    # -----------------------------------------------------
-    # SMART PADDING
-    # -----------------------------------------------------
-
-    # Slightly more room around characters.
-    padding_x = max(
-        8,
-        int(subject_w * 0.10)
     )
 
-    padding_y = max(
-        8,
-        int(subject_h * 0.10)
+    pad_y = max(
+        12,
+        int(
+            subject_height * 0.08
+        )
     )
 
     left = max(
         0,
-        left - padding_x
+        left - pad_x
     )
 
     top = max(
         0,
-        top - padding_y
+        top - pad_y
     )
 
     right = min(
-        removed.width,
-        right + padding_x
+        rgba.width,
+        right + pad_x
     )
 
     bottom = min(
-        removed.height,
-        bottom + padding_y
+        rgba.height,
+        bottom + pad_y
     )
 
-    cropped = removed.crop(
+    cropped = rgba.crop(
         (
             left,
             top,
@@ -580,37 +671,32 @@ def preprocess_image(image):
         )
     )
 
-    print(
-        "[IMAGE] Cropped:",
-        cropped.size
-    )
-
     # -----------------------------------------------------
     # SQUARE CANVAS
     # -----------------------------------------------------
 
-    w, h = cropped.size
+    width, height = cropped.size
 
-    canvas_size = max(
-        w,
-        h
+    square_size = max(
+        width,
+        height
     )
 
-    # 15% breathing room.
-    canvas_size = int(
-        canvas_size * 1.15
+    # 12% breathing room.
+    square_size = int(
+        square_size * 1.12
     )
 
-    canvas_size = max(
-        canvas_size,
+    square_size = max(
+        square_size,
         512
     )
 
     canvas = Image.new(
         "RGBA",
         (
-            canvas_size,
-            canvas_size
+            square_size,
+            square_size
         ),
         (
             255,
@@ -621,11 +707,11 @@ def preprocess_image(image):
     )
 
     x = (
-        canvas_size - w
+        square_size - width
     ) // 2
 
     y = (
-        canvas_size - h
+        square_size - height
     ) // 2
 
     canvas.alpha_composite(
@@ -637,26 +723,29 @@ def preprocess_image(image):
     )
 
     # -----------------------------------------------------
-    # MODEL INPUT
+    # FINAL MODEL INPUT
+    #
+    # Hunyuan's image conditioning benefits from a clean
+    # square input with consistent framing.
     # -----------------------------------------------------
 
-    target_size = 1024
+    model_size = 1024
 
     model_input = canvas.resize(
         (
-            target_size,
-            target_size
+            model_size,
+            model_size
         ),
         Image.Resampling.LANCZOS
     )
 
     print(
-        "[IMAGE] Final model input:",
+        "[IMAGE] Final input:",
         model_input.size
     )
 
     print(
-        "[IMAGE] Preprocessing time:",
+        "[IMAGE] Preprocessing:",
         timer.elapsed(),
         "sec"
     )
@@ -665,36 +754,16 @@ def preprocess_image(image):
 
 
 # =========================================================
-# MESH QUALITY HELPERS
+# MESH VALIDATION
 # =========================================================
 
-def get_mesh_bounds(mesh):
+def validate_mesh(mesh):
 
-    try:
+    if mesh is None:
 
-        extents = np.asarray(
-            mesh.extents,
-            dtype=np.float64
+        raise RuntimeError(
+            "Hunyuan returned no mesh."
         )
-
-        if extents.shape != (3,):
-
-            return None
-
-        if not np.all(
-            np.isfinite(extents)
-        ):
-
-            return None
-
-        return extents
-
-    except Exception:
-
-        return None
-
-
-def mesh_has_valid_geometry(mesh):
 
     try:
 
@@ -706,323 +775,207 @@ def mesh_has_valid_geometry(mesh):
             mesh.faces
         )
 
-        if len(vertices) < 10:
-            return False
+    except Exception as e:
 
-        if len(faces) < 10:
-            return False
+        raise RuntimeError(
+            f"Unable to read generated mesh: {e}"
+        )
+
+    # -----------------------------------------------------
+    # Minimum geometry
+    # -----------------------------------------------------
+
+    if len(vertices) < 20:
+
+        raise RuntimeError(
+            "Generated mesh has too few vertices."
+        )
+
+    if len(faces) < 20:
+
+        raise RuntimeError(
+            "Generated mesh has too few faces."
+        )
+
+    # -----------------------------------------------------
+    # FINITE VALUES
+    # -----------------------------------------------------
+
+    if not np.all(
+        np.isfinite(vertices)
+    ):
+
+        raise RuntimeError(
+            "Generated mesh contains NaN/Inf vertices."
+        )
+
+    # -----------------------------------------------------
+    # BOUNDS
+    # -----------------------------------------------------
+
+    try:
+
+        extents = np.asarray(
+            mesh.extents,
+            dtype=np.float64
+        )
 
         if not np.all(
-            np.isfinite(vertices)
+            np.isfinite(extents)
         ):
 
-            return False
-
-        if not np.all(
-            np.isfinite(faces)
-        ):
-
-            return False
-
-        return True
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# MESH COMPONENT CLEANUP
-# =========================================================
-
-def remove_small_components(
-    mesh,
-    min_component_ratio=0.002
-):
-    """
-    Remove tiny disconnected mesh components.
-
-    This is conservative so we do not accidentally remove
-    legitimate small character accessories.
-    """
-
-    print(
-        "[MESH] Checking connected components..."
-    )
-
-    try:
-
-        components = mesh.split(
-            only_watertight=False
-        )
-
-        if not components:
-            return mesh
-
-        if len(components) == 1:
-
-            print(
-                "[MESH] One connected component."
+            raise RuntimeError(
+                "Generated mesh has invalid bounds."
             )
 
-            return mesh
+        if np.max(extents) <= 0:
 
-        areas = []
-
-        for component in components:
-
-            try:
-
-                areas.append(
-                    float(
-                        component.area
-                    )
-                )
-
-            except Exception:
-
-                areas.append(
-                    0.0
-                )
-
-        total_area = sum(
-            areas
-        )
-
-        if total_area <= 0:
-
-            return mesh
-
-        kept = []
-
-        for component, area in zip(
-            components,
-            areas
-        ):
-
-            ratio = (
-                area /
-                total_area
+            raise RuntimeError(
+                "Generated mesh has zero size."
             )
 
-            if ratio >= min_component_ratio:
+    except RuntimeError:
 
-                kept.append(
-                    component
-                )
-
-        if not kept:
-
-            return mesh
-
-        if len(kept) == len(
-            components
-        ):
-
-            return mesh
-
-        print(
-            "[MESH] Components:",
-            len(components)
-        )
-
-        print(
-            "[MESH] Components kept:",
-            len(kept)
-        )
-
-        # Concatenate.
-        import trimesh
-
-        return trimesh.util.concatenate(
-            kept
-        )
+        raise
 
     except Exception as e:
 
-        print(
-            "[MESH] Component cleanup skipped:",
-            e
+        raise RuntimeError(
+            f"Mesh bounds validation failed: {e}"
         )
 
-        return mesh
+    return True
 
 
 # =========================================================
-# NORMAL REPAIR
-# =========================================================
-
-def repair_normals(mesh):
-
-    try:
-
-        if hasattr(
-            mesh,
-            "remove_duplicate_faces"
-        ):
-
-            mesh.remove_duplicate_faces()
-
-    except Exception as e:
-
-        print(
-            "[MESH] Duplicate face cleanup skipped:",
-            e
-        )
-
-    try:
-
-        if hasattr(
-            mesh,
-            "fix_normals"
-        ):
-
-            mesh.fix_normals()
-
-    except Exception as e:
-
-        print(
-            "[MESH] Normal repair skipped:",
-            e
-        )
-
-    return mesh
-
-
-# =========================================================
-# MESH CLEANUP
+# SAFE MESH CLEANUP
 # =========================================================
 
 def clean_mesh(mesh):
 
-    timer = StageTimer()
+    """
+    Conservative cleanup.
+
+    We intentionally DO NOT remove small connected
+    components because characters may legitimately contain:
+
+        eyes
+        hair pieces
+        shoes
+        accessories
+        fingers
+        clothing parts
+
+    The official PBR pipeline also performs its own mesh
+    processing/remeshing.
+    """
+
+    timer = Timer()
 
     print("")
-    print("----------------------------------------------------")
-    print("[MESH] CLEANUP")
-    print("----------------------------------------------------")
+    print("------------------------------------------------------")
+    print(" MESH VALIDATION")
+    print("------------------------------------------------------")
 
-    if not mesh_has_valid_geometry(
+    validate_mesh(
         mesh
-    ):
-
-        raise RuntimeError(
-            "Generated mesh contains invalid geometry."
-        )
+    )
 
     # -----------------------------------------------------
-    # Basic cleanup
+    # Remove duplicate vertices
     # -----------------------------------------------------
 
     try:
 
-        if hasattr(
-            mesh,
-            "remove_duplicate_vertices"
-        ):
-
-            mesh.remove_duplicate_vertices()
+        mesh.remove_duplicate_vertices()
 
     except Exception as e:
 
         print(
-            "[MESH] Duplicate vertices skipped:",
-            e
+            "[MESH] Duplicate vertex cleanup skipped:",
+            str(e)
         )
+
+    # -----------------------------------------------------
+    # Remove unreferenced vertices
+    # -----------------------------------------------------
 
     try:
 
-        if hasattr(
-            mesh,
-            "remove_unreferenced_vertices"
-        ):
-
-            mesh.remove_unreferenced_vertices()
+        mesh.remove_unreferenced_vertices()
 
     except Exception as e:
 
         print(
-            "[MESH] Unreferenced vertices skipped:",
-            e
+            "[MESH] Unreferenced vertex cleanup skipped:",
+            str(e)
         )
+
+    # -----------------------------------------------------
+    # Remove degenerate faces
+    # -----------------------------------------------------
 
     try:
 
-        if hasattr(
-            mesh,
-            "remove_degenerate_faces"
-        ):
-
-            mesh.remove_degenerate_faces()
+        mesh.remove_degenerate_faces()
 
     except Exception as e:
 
         print(
-            "[MESH] Degenerate faces skipped:",
-            e
+            "[MESH] Degenerate face cleanup skipped:",
+            str(e)
         )
+
+    # -----------------------------------------------------
+    # Remove infinite values
+    # -----------------------------------------------------
 
     try:
 
-        if hasattr(
-            mesh,
-            "remove_infinite_values"
-        ):
-
-            mesh.remove_infinite_values()
+        mesh.remove_infinite_values()
 
     except Exception as e:
 
         print(
             "[MESH] Infinite-value cleanup skipped:",
-            e
+            str(e)
         )
 
     # -----------------------------------------------------
-    # Components
+    # Repair normals
     # -----------------------------------------------------
-
-    mesh = remove_small_components(
-        mesh
-    )
-
-    # -----------------------------------------------------
-    # Normals
-    # -----------------------------------------------------
-
-    mesh = repair_normals(
-        mesh
-    )
-
-    # -----------------------------------------------------
-    # Final validation
-    # -----------------------------------------------------
-
-    if not mesh_has_valid_geometry(
-        mesh
-    ):
-
-        raise RuntimeError(
-            "Mesh became invalid after cleanup."
-        )
 
     try:
 
-        print(
-            "[MESH] Vertices:",
-            len(mesh.vertices)
-        )
+        mesh.fix_normals()
+
+    except Exception as e:
 
         print(
-            "[MESH] Faces:",
-            len(mesh.faces)
+            "[MESH] Normal repair skipped:",
+            str(e)
         )
 
-    except Exception:
-        pass
+    # -----------------------------------------------------
+    # FINAL VALIDATION
+    # -----------------------------------------------------
+
+    validate_mesh(
+        mesh
+    )
 
     print(
-        "[MESH] Cleanup time:",
+        "[MESH] Vertices:",
+        len(mesh.vertices)
+    )
+
+    print(
+        "[MESH] Faces:",
+        len(mesh.faces)
+    )
+
+    print(
+        "[MESH] Validation:",
         timer.elapsed(),
         "sec"
     )
@@ -1031,205 +984,53 @@ def clean_mesh(mesh):
 
 
 # =========================================================
-# MESH QUALITY SCORE
-# =========================================================
-
-def score_mesh(mesh):
-
-    """
-    Conservative automatic geometry score.
-
-    This is NOT a semantic AI quality judge.
-
-    It mainly detects:
-    - invalid geometry
-    - tiny meshes
-    - extreme dimensions
-    - bad numerical values
-    - excessive disconnected components
-    """
-
-    score = 100.0
-
-    try:
-
-        vertices = np.asarray(
-            mesh.vertices,
-            dtype=np.float64
-        )
-
-        faces = np.asarray(
-            mesh.faces
-        )
-
-        # -------------------------------------------------
-        # Geometry validity
-        # -------------------------------------------------
-
-        if len(vertices) < 100:
-
-            score -= 50
-
-        if len(faces) < 100:
-
-            score -= 30
-
-        if not np.all(
-            np.isfinite(vertices)
-        ):
-
-            return 0.0
-
-        # -------------------------------------------------
-        # Dimensions
-        # -------------------------------------------------
-
-        extents = get_mesh_bounds(
-            mesh
-        )
-
-        if extents is None:
-
-            score -= 50
-
-        else:
-
-            max_extent = max(
-                extents
-            )
-
-            min_extent = min(
-                extents
-            )
-
-            if max_extent <= 0:
-
-                return 0.0
-
-            aspect = (
-                min_extent /
-                max_extent
-            )
-
-            # Extremely thin/flat result.
-            if aspect < 0.005:
-
-                score -= 20
-
-        # -------------------------------------------------
-        # NaN / Inf
-        # -------------------------------------------------
-
-        if not np.all(
-            np.isfinite(vertices)
-        ):
-
-            score -= 100
-
-        # -------------------------------------------------
-        # Components
-        # -------------------------------------------------
-
-        try:
-
-            components = mesh.split(
-                only_watertight=False
-            )
-
-            if len(components) > 1:
-
-                # Don't punish a character too much for
-                # legitimate accessories.
-                penalty = min(
-                    15,
-                    len(components) - 1
-                )
-
-                score -= penalty
-
-        except Exception:
-            pass
-
-        # -------------------------------------------------
-        # Bounding-box center sanity
-        # -------------------------------------------------
-
-        try:
-
-            center = np.asarray(
-                mesh.bounding_box.centroid,
-                dtype=np.float64
-            )
-
-            if not np.all(
-                np.isfinite(center)
-            ):
-
-                score -= 20
-
-        except Exception:
-            pass
-
-    except Exception as e:
-
-        print(
-            "[SCORE] Failed:",
-            e
-        )
-
-        return 0.0
-
-    return max(
-        0.0,
-        min(
-            100.0,
-            score
-        )
-    )
-
-
-# =========================================================
-# SAVE MESH
-# =========================================================
-
-def save_temp_mesh(
-    mesh,
-    suffix=".glb"
-):
-
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=suffix,
-        delete=False
-    )
-
-    tmp.close()
-
-    mesh.export(
-        tmp.name
-    )
-
-    return tmp.name
-
-
-# =========================================================
-# GENERATE SINGLE CANDIDATE
+# SHAPE GENERATION
 # =========================================================
 
 def generate_shape(
     image,
     seed,
-    config
+    steps,
+    octree_resolution,
+    guidance_scale,
+    num_chunks
 ):
 
+    timer = Timer()
+
     print("")
-    print(
-        "[SHAPE] Generating candidate."
-    )
+    print("======================================================")
+    print(" HUNYUAN3D SHAPE GENERATION")
+    print("======================================================")
 
     print(
         "[SHAPE] Seed:",
         seed
     )
+
+    print(
+        "[SHAPE] Steps:",
+        steps
+    )
+
+    print(
+        "[SHAPE] Octree:",
+        octree_resolution
+    )
+
+    print(
+        "[SHAPE] Guidance:",
+        guidance_scale
+    )
+
+    print(
+        "[SHAPE] Chunks:",
+        num_chunks
+    )
+
+    # -----------------------------------------------------
+    # RANDOM GENERATOR
+    # -----------------------------------------------------
 
     generator = torch.Generator(
         device=shape_pipeline.device
@@ -1239,50 +1040,50 @@ def generate_shape(
         seed
     )
 
-    timer = StageTimer()
+    # -----------------------------------------------------
+    # INFERENCE
+    # -----------------------------------------------------
 
-    result = shape_pipeline(
+    with torch.inference_mode():
 
-        image=image,
+        result = shape_pipeline(
 
-        num_inference_steps=(
-            config["steps"]
-        ),
+            image=image,
 
-        guidance_scale=(
-            config["guidance_scale"]
-        ),
+            num_inference_steps=steps,
 
-        octree_resolution=(
-            config["octree_resolution"]
-        ),
+            guidance_scale=guidance_scale,
 
-        num_chunks=(
-            config["num_chunks"]
-        ),
+            octree_resolution=octree_resolution,
 
-        generator=generator,
+            num_chunks=num_chunks,
 
-        mc_algo="mc",
+            generator=generator,
 
-        output_type="trimesh",
+            mc_algo="mc",
 
-        enable_pbar=False,
-    )
+            output_type="trimesh",
 
-    if not result:
-
-        raise RuntimeError(
-            "Shape pipeline returned no result."
+            enable_pbar=False,
         )
 
-    mesh = result[0]
-
-    if mesh is None:
+    if result is None:
 
         raise RuntimeError(
             "Shape pipeline returned None."
         )
+
+    if len(result) == 0:
+
+        raise RuntimeError(
+            "Shape pipeline returned an empty result."
+        )
+
+    mesh = result[0]
+
+    validate_mesh(
+        mesh
+    )
 
     print(
         "[SHAPE] Generation time:",
@@ -1294,216 +1095,282 @@ def generate_shape(
 
 
 # =========================================================
-# GENERATE BEST CANDIDATE
+# SAVE MESH
 # =========================================================
 
-def generate_best_shape(
-    image,
-    base_seed,
-    config
-):
+def save_mesh(mesh):
 
-    candidate_count = max(
-        1,
-        int(
-            config["candidate_count"]
-        )
+    file = tempfile.NamedTemporaryFile(
+        suffix=".glb",
+        delete=False
     )
 
-    candidates = []
+    path = file.name
 
-    print("")
-    print("====================================================")
-    print(" CANDIDATE GENERATION")
-    print("====================================================")
+    file.close()
 
-    print(
-        "[CANDIDATES]:",
-        candidate_count
-    )
+    try:
 
-    for index in range(
-        candidate_count
-    ):
-
-        # Deterministic but different.
-        seed = (
-            base_seed +
-            index * 7919
-        ) % (
-            2**32
+        mesh.export(
+            path
         )
+
+    except Exception:
 
         try:
+            os.remove(path)
+        except Exception:
+            pass
 
-            candidate = generate_shape(
-                image=image,
-                seed=seed,
-                config=config
-            )
+        raise
 
-            candidate = clean_mesh(
-                candidate
-            )
-
-            score = score_mesh(
-                candidate
-            )
-
-            print(
-                "[CANDIDATE]",
-                index + 1,
-                "score:",
-                round(
-                    score,
-                    2
-                )
-            )
-
-            candidates.append(
-                {
-                    "mesh": candidate,
-                    "seed": seed,
-                    "score": score,
-                }
-            )
-
-        except Exception as e:
-
-            print(
-                "[CANDIDATE]",
-                index + 1,
-                "FAILED:",
-                e
-            )
-
-            traceback.print_exc()
-
-        finally:
-
-            # Keep memory under control.
-            gc.collect()
-
-            if torch.cuda.is_available():
-
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-    if not candidates:
+    if not os.path.exists(path):
 
         raise RuntimeError(
-            "All shape candidates failed."
+            "Failed to create temporary GLB."
         )
 
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
+    if os.path.getsize(path) == 0:
 
-    best = candidates[0]
-
-    print("")
-    print(
-        "[CANDIDATE] Best seed:",
-        best["seed"]
-    )
-
-    print(
-        "[CANDIDATE] Best score:",
-        round(
-            best["score"],
-            2
+        raise RuntimeError(
+            "Temporary GLB is empty."
         )
-    )
 
-    return (
-        best["mesh"],
-        best["seed"],
-        best["score"]
-    )
+    return path
 
 
 # =========================================================
-# TEXTURE GENERATION
+# PBR TEXTURE GENERATION
 # =========================================================
 
 def generate_texture(
     mesh_path,
-    image_path,
-    config
+    image_path
 ):
 
-    print("")
-    print("====================================================")
-    print(" PBR TEXTURE GENERATION")
-    print("====================================================")
+    timer = Timer()
 
-    # -----------------------------------------------------
-    # IMPORTANT:
-    #
-    # The global paint pipeline is initialized using the
-    # Ultra configuration.
-    #
-    # For High mode, we still use the loaded Ultra model.
-    # The pipeline itself performs adaptive view selection.
-    # -----------------------------------------------------
+    print("")
+    print("======================================================")
+    print(" OFFICIAL HUNYUAN PBR TEXTURE GENERATION")
+    print("======================================================")
+
+    print(
+        "[PAINT] Views:",
+        PAINT_MAX_NUM_VIEW
+    )
+
+    print(
+        "[PAINT] Resolution:",
+        PAINT_RESOLUTION
+    )
 
     output_file = tempfile.NamedTemporaryFile(
         suffix="_textured.glb",
         delete=False
     )
 
-    output_file.close()
-
     output_path = output_file.name
 
-    timer = StageTimer()
+    output_file.close()
 
-    textured_path = paint_pipeline(
+    try:
 
-        mesh_path=mesh_path,
+        with torch.inference_mode():
 
-        image_path=image_path,
+            result = paint_pipeline(
 
-        output_mesh_path=output_path
-    )
+                mesh_path=mesh_path,
+
+                image_path=image_path,
+
+                output_mesh_path=output_path
+            )
+
+    except Exception:
+
+        try:
+
+            os.remove(output_path)
+
+        except Exception:
+            pass
+
+        raise
+
+    # -----------------------------------------------------
+    # PIPELINE MAY RETURN OUTPUT PATH
+    # -----------------------------------------------------
+
+    final_path = result
+
+    if not final_path:
+
+        final_path = output_path
+
+    if not isinstance(
+        final_path,
+        str
+    ):
+
+        final_path = output_path
+
+    if not os.path.exists(
+        final_path
+    ):
+
+        raise RuntimeError(
+            "PBR pipeline did not create a GLB."
+        )
+
+    if os.path.getsize(
+        final_path
+    ) == 0:
+
+        raise RuntimeError(
+            "PBR pipeline created an empty GLB."
+        )
 
     print(
-        "[TEXTURE] Time:",
+        "[PAINT] Generation time:",
         timer.elapsed(),
         "sec"
     )
 
-    if not textured_path:
-
-        raise RuntimeError(
-            "Paint pipeline returned no output."
-        )
-
-    if not os.path.exists(
-        textured_path
-    ):
-
-        raise RuntimeError(
-            "Paint pipeline output file does not exist."
-        )
-
-    return textured_path
+    return final_path
 
 
 # =========================================================
-# HANDLER
+# CLEANUP HELPER
+# =========================================================
+
+def remove_file(path):
+
+    if not path:
+
+        return
+
+    try:
+
+        if os.path.exists(path):
+
+            os.remove(path)
+
+    except Exception as e:
+
+        print(
+            "[CLEANUP] Could not remove:",
+            path,
+            str(e)
+        )
+
+
+# =========================================================
+# CUDA CLEANUP
+# =========================================================
+
+def cleanup_memory():
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+
+        try:
+
+            torch.cuda.empty_cache()
+
+        except Exception:
+            pass
+
+        try:
+
+            torch.cuda.ipc_collect()
+
+        except Exception:
+            pass
+
+
+# =========================================================
+# INPUT VALIDATION
+# =========================================================
+
+def get_integer(
+    value,
+    name,
+    minimum,
+    maximum
+):
+
+    try:
+
+        value = int(value)
+
+    except Exception:
+
+        raise ValueError(
+            f"{name} must be an integer."
+        )
+
+    if value < minimum:
+
+        raise ValueError(
+            f"{name} must be >= {minimum}."
+        )
+
+    if value > maximum:
+
+        raise ValueError(
+            f"{name} must be <= {maximum}."
+        )
+
+    return value
+
+
+def get_float(
+    value,
+    name,
+    minimum,
+    maximum
+):
+
+    try:
+
+        value = float(value)
+
+    except Exception:
+
+        raise ValueError(
+            f"{name} must be a number."
+        )
+
+    if value < minimum:
+
+        raise ValueError(
+            f"{name} must be >= {minimum}."
+        )
+
+    if value > maximum:
+
+        raise ValueError(
+            f"{name} must be <= {maximum}."
+        )
+
+    return value
+
+
+# =========================================================
+# MAIN RUNPOD HANDLER
 # =========================================================
 
 def handler(job):
 
-    shape_path = None
-    image_path = None
-    textured_output_path = None
+    start_time = time.perf_counter()
 
-    overall_timer = StageTimer()
+    image_path = None
+
+    shape_path = None
+
+    textured_path = None
 
     try:
 
@@ -1522,7 +1389,7 @@ def handler(job):
         ):
 
             raise ValueError(
-                "'input' must be an object."
+                "job.input must be an object."
             )
 
         image_b64 = job_input.get(
@@ -1532,179 +1399,92 @@ def handler(job):
         if not image_b64:
 
             raise ValueError(
-                "Missing 'image_base64'."
+                "Missing image_base64."
             )
 
         # =================================================
-        # QUALITY
+        # SETTINGS
         # =================================================
 
-        quality = str(
-            job_input.get(
-                "quality",
-                "ultra"
-            )
-        ).lower().strip()
+        seed = get_integer(
 
-        if quality not in QUALITY_PRESETS:
-
-            raise ValueError(
-                "Invalid quality. "
-                "Use: fast, high, or ultra."
-            )
-
-        config = dict(
-            QUALITY_PRESETS[
-                quality
-            ]
-        )
-
-        # =================================================
-        # OPTIONAL OVERRIDES
-        # =================================================
-
-        override_keys = [
-            "steps",
-            "octree_resolution",
-            "guidance_scale",
-            "num_chunks",
-            "texture_resolution",
-            "max_num_view",
-            "candidate_count",
-            "face_count",
-        ]
-
-        for key in override_keys:
-
-            if key in job_input:
-
-                config[key] = job_input[key]
-
-        # -------------------------------------------------
-        # Clamp values
-        # -------------------------------------------------
-
-        config["steps"] = max(
-            1,
-            min(
-                100,
-                int(
-                    config["steps"]
-                )
-            )
-        )
-
-        config["octree_resolution"] = max(
-            64,
-            min(
-                512,
-                int(
-                    config[
-                        "octree_resolution"
-                    ]
-                )
-            )
-        )
-
-        config["guidance_scale"] = max(
-            0.1,
-            min(
-                20.0,
-                float(
-                    config[
-                        "guidance_scale"
-                    ]
-                )
-            )
-        )
-
-        config["num_chunks"] = max(
-            1000,
-            min(
-                20000,
-                int(
-                    config["num_chunks"]
-                )
-            )
-        )
-
-        config["texture_resolution"] = int(
-            config[
-                "texture_resolution"
-            ]
-        )
-
-        if config[
-            "texture_resolution"
-        ] not in (
-            512,
-            768
-        ):
-
-            raise ValueError(
-                "texture_resolution must be 512 or 768."
-            )
-
-        config["max_num_view"] = max(
-            6,
-            min(
-                12,
-                int(
-                    config[
-                        "max_num_view"
-                    ]
-                )
-            )
-        )
-
-        config["candidate_count"] = max(
-            1,
-            min(
-                4,
-                int(
-                    config[
-                        "candidate_count"
-                    ]
-                )
-            )
-        )
-
-        config["face_count"] = max(
-            1000,
-            min(
-                100000,
-                int(
-                    config["face_count"]
-                )
-            )
-        )
-
-        seed = int(
             job_input.get(
                 "seed",
                 DEFAULT_SEED
-            )
+            ),
+
+            "seed",
+
+            0,
+
+            2**32 - 1
         )
 
-        if seed < 0:
+        steps = get_integer(
 
-            raise ValueError(
-                "seed must be >= 0."
-            )
+            job_input.get(
+                "steps",
+                DEFAULT_STEPS
+            ),
+
+            "steps",
+
+            20,
+
+            100
+        )
+
+        octree_resolution = get_integer(
+
+            job_input.get(
+                "octree_resolution",
+                DEFAULT_OCTREE_RESOLUTION
+            ),
+
+            "octree_resolution",
+
+            128,
+
+            512
+        )
+
+        guidance_scale = get_float(
+
+            job_input.get(
+                "guidance_scale",
+                DEFAULT_GUIDANCE_SCALE
+            ),
+
+            "guidance_scale",
+
+            1.0,
+
+            10.0
+        )
+
+        num_chunks = get_integer(
+
+            job_input.get(
+                "num_chunks",
+                DEFAULT_NUM_CHUNKS
+            ),
+
+            "num_chunks",
+
+            2000,
+
+            20000
+        )
 
         # =================================================
-        # LOG CONFIG
+        # LOG
         # =================================================
 
         print("")
-        print("====================================================")
-        print(" NEW V2 3D GENERATION")
-        print("====================================================")
-
-        print(
-            "[CONFIG] Quality:",
-            quality
-        )
+        print("")
+        print("======================================================")
+        print(" NEW HUNYUAN3D GENERATION")
+        print("======================================================")
 
         print(
             "[CONFIG] Seed:",
@@ -1713,61 +1493,44 @@ def handler(job):
 
         print(
             "[CONFIG] Steps:",
-            config["steps"]
+            steps
         )
 
         print(
             "[CONFIG] Octree:",
-            config[
-                "octree_resolution"
-            ]
+            octree_resolution
         )
 
         print(
             "[CONFIG] Guidance:",
-            config[
-                "guidance_scale"
-            ]
+            guidance_scale
         )
 
         print(
             "[CONFIG] Chunks:",
-            config[
-                "num_chunks"
-            ]
+            num_chunks
         )
 
         print(
-            "[CONFIG] Texture:",
-            config[
-                "texture_resolution"
-            ]
+            "[CONFIG] Paint views:",
+            PAINT_MAX_NUM_VIEW
         )
 
         print(
-            "[CONFIG] Views:",
-            config[
-                "max_num_view"
-            ]
-        )
-
-        print(
-            "[CONFIG] Candidates:",
-            config[
-                "candidate_count"
-            ]
+            "[CONFIG] Paint resolution:",
+            PAINT_RESOLUTION
         )
 
         # =================================================
-        # DECODE
+        # DECODE IMAGE
         # =================================================
 
         print("")
         print(
-            "[IMAGE] Decoding input..."
+            "[IMAGE] Decoding..."
         )
 
-        image_bytes = decode_base64_image(
+        image_bytes = decode_image_base64(
             image_b64
         )
 
@@ -1779,13 +1542,12 @@ def handler(job):
                 )
             )
 
-            # Force actual loading now.
             original_image.load()
 
         except Exception as e:
 
             raise ValueError(
-                f"Unable to decode image: {e}"
+                f"Unable to open uploaded image: {e}"
             )
 
         print(
@@ -1798,12 +1560,12 @@ def handler(job):
         # PREPROCESS
         # =================================================
 
-        image = preprocess_image(
+        model_image = preprocess_image(
             original_image
         )
 
         # =================================================
-        # SAVE CLEAN IMAGE
+        # SAVE INPUT IMAGE
         # =================================================
 
         image_file = tempfile.NamedTemporaryFile(
@@ -1815,14 +1577,13 @@ def handler(job):
 
         image_file.close()
 
-        image.save(
+        model_image.save(
             image_path,
-            format="PNG",
-            optimize=True
+            format="PNG"
         )
 
         print(
-            "[IMAGE] Clean image:",
+            "[IMAGE] Prepared image:",
             image_path
         )
 
@@ -1830,24 +1591,39 @@ def handler(job):
         # SHAPE
         # =================================================
 
-        mesh, selected_seed, shape_score = (
-            generate_best_shape(
-                image=image,
-                base_seed=seed,
-                config=config
-            )
+        mesh = generate_shape(
+
+            image=model_image,
+
+            seed=seed,
+
+            steps=steps,
+
+            octree_resolution=octree_resolution,
+
+            guidance_scale=guidance_scale,
+
+            num_chunks=num_chunks
+        )
+
+        # =================================================
+        # SAFE CLEANUP
+        # =================================================
+
+        mesh = clean_mesh(
+            mesh
         )
 
         # =================================================
         # SAVE SHAPE
         # =================================================
 
-        shape_path = save_temp_mesh(
+        shape_path = save_mesh(
             mesh
         )
 
         print(
-            "[MESH] Temporary GLB:",
+            "[MESH] Shape GLB:",
             shape_path
         )
 
@@ -1855,153 +1631,121 @@ def handler(job):
         # TEXTURE
         # =================================================
 
-        textured_mesh_path = generate_texture(
-            mesh_path=shape_path,
-            image_path=image_path,
-            config=config
-        )
+        textured_path = generate_texture(
 
-        textured_output_path = (
-            textured_mesh_path
+            mesh_path=shape_path,
+
+            image_path=image_path
         )
 
         # =================================================
-        # READ RESULT
+        # READ GLB
         # =================================================
 
         with open(
-            textured_mesh_path,
+            textured_path,
             "rb"
         ) as f:
 
-            result_bytes = f.read()
+            output_bytes = f.read()
 
-        if not result_bytes:
+        if not output_bytes:
 
             raise RuntimeError(
-                "Generated GLB is empty."
+                "Final GLB is empty."
             )
 
-        result_b64 = (
-            base64.b64encode(
-                result_bytes
-            ).decode(
-                "utf-8"
-            )
+        # =================================================
+        # BASE64
+        # =================================================
+
+        output_b64 = base64.b64encode(
+            output_bytes
+        ).decode(
+            "utf-8"
         )
 
         # =================================================
-        # SUCCESS
+        # TOTAL TIME
         # =================================================
 
-        total_time = (
-            overall_timer.elapsed()
+        total_time = round(
+            time.perf_counter()
+            - start_time,
+            3
         )
 
         print("")
-        print("====================================================")
-        print(" GENERATION COMPLETE")
-        print("====================================================")
+        print("======================================================")
+        print(" GENERATION SUCCESS")
+        print("======================================================")
 
         print(
-            "[OUTPUT] GLB bytes:",
-            len(result_bytes)
-        )
-
-        print(
-            "[OUTPUT] Selected seed:",
-            selected_seed
-        )
-
-        print(
-            "[OUTPUT] Geometry score:",
+            "[OUTPUT] Size:",
             round(
-                shape_score,
+                len(output_bytes) / (1024 * 1024),
                 2
-            )
+            ),
+            "MB"
         )
 
         print(
             "[OUTPUT] Total time:",
             total_time,
-            "sec"
+            "seconds"
         )
 
         return {
 
             "model_base64":
-                result_b64,
+                output_b64,
 
             "format":
                 "glb",
 
-            "quality":
-                quality,
+            "success":
+                True,
 
             "settings": {
 
                 "seed":
-                    selected_seed,
-
-                "requested_seed":
                     seed,
 
                 "steps":
-                    config[
-                        "steps"
-                    ],
+                    steps,
 
                 "octree_resolution":
-                    config[
-                        "octree_resolution"
-                    ],
+                    octree_resolution,
 
                 "guidance_scale":
-                    config[
-                        "guidance_scale"
-                    ],
+                    guidance_scale,
 
                 "num_chunks":
-                    config[
-                        "num_chunks"
-                    ],
+                    num_chunks,
+
+                "texture_views":
+                    PAINT_MAX_NUM_VIEW,
 
                 "texture_resolution":
-                    config[
-                        "texture_resolution"
-                    ],
+                    PAINT_RESOLUTION,
 
-                "max_num_view":
-                    config[
-                        "max_num_view"
-                    ],
+                "flashvdm":
+                    ENABLE_FLASHVDM,
 
-                "candidate_count":
-                    config[
-                        "candidate_count"
-                    ],
-
-                "geometry_score":
-                    round(
-                        shape_score,
-                        2
-                    ),
+                "compile":
+                    ENABLE_COMPILE,
 
                 "generation_time_seconds":
                     total_time
             }
         }
 
-    # =====================================================
-    # ERROR
-    # =====================================================
-
     except Exception as e:
 
         print("")
-        print("====================================================")
-        print(" GENERATION ERROR")
-        print("====================================================")
+        print("======================================================")
+        print(" GENERATION FAILED")
+        print("======================================================")
 
         print(
             "[ERROR]",
@@ -2012,102 +1756,47 @@ def handler(job):
 
         return {
 
+            "success":
+                False,
+
             "error":
                 str(e),
 
             "type":
-                type(e).__name__,
+                type(e).__name__
         }
-
-    # =====================================================
-    # CLEANUP
-    # =====================================================
 
     finally:
 
         print(
-            "[CLEANUP] Starting cleanup..."
+            "[CLEANUP] Cleaning temporary files..."
         )
 
-        paths = [
-            shape_path,
-            image_path,
-            textured_output_path,
-        ]
+        remove_file(
+            image_path
+        )
 
-        for path in paths:
+        remove_file(
+            shape_path
+        )
 
-            if not path:
-                continue
+        remove_file(
+            textured_path
+        )
 
-            try:
-
-                if os.path.exists(
-                    path
-                ):
-
-                    os.remove(
-                        path
-                    )
-
-                    print(
-                        "[CLEANUP] Removed:",
-                        path
-                    )
-
-            except Exception as e:
-
-                print(
-                    "[CLEANUP] Could not remove:",
-                    path,
-                    e
-                )
-
-        # -------------------------------------------------
-        # Python memory
-        # -------------------------------------------------
-
-        gc.collect()
-
-        # -------------------------------------------------
-        # CUDA
-        # -------------------------------------------------
-
-        if torch.cuda.is_available():
-
-            try:
-
-                torch.cuda.empty_cache()
-
-            except Exception as e:
-
-                print(
-                    "[CUDA] empty_cache failed:",
-                    e
-                )
-
-            try:
-
-                torch.cuda.ipc_collect()
-
-            except Exception as e:
-
-                print(
-                    "[CUDA] ipc_collect failed:",
-                    e
-                )
+        cleanup_memory()
 
         print(
-            "[CLEANUP] Finished."
+            "[CLEANUP] Complete."
         )
 
 
 # =========================================================
-# RUNPOD
+# RUNPOD SERVERLESS
 # =========================================================
 
 print(
-    "[RUNPOD] Starting serverless handler..."
+    "[RUNPOD] Starting serverless worker..."
 )
 
 runpod.serverless.start({
